@@ -95,9 +95,15 @@ class MoveGroupInterface::MoveGroupInterfaceImpl
   friend MoveGroupInterface;
 
 public:
+
+  bool isAsyncExecutionActive() const;
+  bool isAsyncExecutionDone() const;
+  bool wasAsyncExecutionSuccessful() const;
+  moveit_msgs::action::MoveGroup::Result::SharedPtr getAsyncExecutionResult() const;
+  void cancelAsyncExecution();
   MoveGroupInterfaceImpl(const rclcpp::Node::SharedPtr& node, const Options& opt,
                          const std::shared_ptr<tf2_ros::Buffer>& tf_buffer, const rclcpp::Duration& wait_for_servers)
-    : opt_(opt), node_(node), tf_buffer_(tf_buffer)
+    : opt_(opt), node_(node), tf_buffer_(tf_buffer), async_state_(std::make_shared<AsyncState>())
   {
     // We have no control on how the passed node is getting executed. To make sure MGI is functional, we're creating
     // our own callback group which is managed in a separate callback thread
@@ -186,7 +192,15 @@ public:
   }
 
   ~MoveGroupInterfaceImpl()
-  {
+  {  
+    if (async_state_->active.load() && async_state_->goal_handle && move_action_client_)
+    {
+      try {
+        move_action_client_->async_cancel_goal(async_state_->goal_handle);
+      } catch (...) {
+        // Ignore errors during cleanup
+      }
+    }
     if (constraints_init_thread_)
       constraints_init_thread_->join();
 
@@ -1314,6 +1328,20 @@ public:
   }
 
 private:
+
+  struct AsyncState {
+      std::atomic<bool> active{false};
+      std::atomic<bool> done{false};
+      std::atomic<bool> success{false};
+      std::mutex result_mutex;
+      moveit_msgs::action::MoveGroup::Result::SharedPtr result;
+      rclcpp_action::ClientGoalHandle<moveit_msgs::action::MoveGroup>::SharedPtr goal_handle;
+    };
+    
+    std::shared_ptr<AsyncState> async_state_;
+    std::mutex async_state_mutex_;
+
+
   void initializeConstraintsStorageThread(const std::string& host, unsigned int port)
   {
     // Set up db
@@ -1410,6 +1438,40 @@ MoveGroupInterface::MoveGroupInterface(const rclcpp::Node::SharedPtr& node, cons
 {
   impl_ = new MoveGroupInterfaceImpl(node, opt, tf_buffer ? tf_buffer : getSharedTF(), wait_for_servers);
 }
+
+bool MoveGroupInterface::MoveGroupInterfaceImpl::isAsyncExecutionActive() const
+{
+  return async_state_->active.load();
+}
+
+bool MoveGroupInterface::MoveGroupInterfaceImpl::isAsyncExecutionDone() const
+{
+  return async_state_->done.load();
+}
+
+bool MoveGroupInterface::MoveGroupInterfaceImpl::wasAsyncExecutionSuccessful() const
+{
+  return async_state_->success.load();
+}
+
+moveit_msgs::action::MoveGroup::Result::SharedPtr 
+MoveGroupInterface::MoveGroupInterfaceImpl::getAsyncExecutionResult() const
+{
+  std::lock_guard<std::mutex> lock(async_state_->result_mutex);
+  return async_state_->result;
+}
+
+void MoveGroupInterface::MoveGroupInterfaceImpl::cancelAsyncExecution()
+{
+  std::lock_guard<std::mutex> lock(async_state_mutex_);
+  if (async_state_->active.load() && async_state_->goal_handle && move_action_client_)
+  {
+    move_action_client_->async_cancel_goal(async_state_->goal_handle);
+    async_state_->active = false;
+  }
+}
+
+
 
 MoveGroupInterface::~MoveGroupInterface()
 {
@@ -1549,9 +1611,125 @@ moveit::core::MoveItErrorCode MoveGroupInterface::execute(const Plan& plan)
   return impl_->execute(plan.trajectory_, true);
 }
 
-moveit::core::MoveItErrorCode MoveGroupInterface::execute(const moveit_msgs::msg::RobotTrajectory& trajectory)
+// moveit::core::MoveItErrorCode MoveGroupInterface::execute(const moveit_msgs::msg::RobotTrajectory& trajectory)
+// {
+//   return impl_->execute(trajectory, true);
+// }
+moveit::core::MoveItErrorCode MoveGroupInterface::MoveGroupInterfaceImpl::execute(
+    const moveit_msgs::msg::RobotTrajectory& trajectory, 
+    bool wait)
 {
-  return impl_->execute(trajectory, true);
+    // This is around line 228 based on your GitHub link
+    if (!move_action_client_ || !move_action_client_->action_server_is_ready())
+    {
+      RCLCPP_ERROR(LOGGER, "MoveGroup action client not ready");
+      return moveit::core::MoveItErrorCode::FAILURE;
+    }
+
+    // Reset async state for new execution
+    if (async)
+    {
+      std::lock_guard<std::mutex> lock(async_state_mutex_);
+      async_state_ = std::make_shared<AsyncState>();
+      async_state_->active = true;
+      async_state_->done = false;
+      async_state_->success = false;
+    }
+
+    moveit_msgs::action::MoveGroup::Goal goal;
+    constructGoal(goal, plan);
+
+    // Capture shared_ptr to async_state to ensure it outlives callbacks
+    auto state_ptr = async_state_;
+    auto logger = node_->get_logger();
+
+    rclcpp_action::Client<moveit_msgs::action::MoveGroup>::SendGoalOptions options;
+    
+    options.goal_response_callback = 
+      [state_ptr, logger](auto goal_handle) {
+        if (!goal_handle) {
+          RCLCPP_ERROR(logger, "Goal was rejected by server");
+          state_ptr->active = false;
+          state_ptr->done = true;
+          state_ptr->success = false;
+        } else {
+          RCLCPP_INFO(logger, "Goal accepted by server, waiting for result");
+          state_ptr->goal_handle = goal_handle;
+        }
+      };
+
+    options.result_callback = 
+      [state_ptr, logger](const auto& result) {
+        state_ptr->active = false;
+        state_ptr->done = true;
+        
+        switch (result.code) {
+          case rclcpp_action::ResultCode::SUCCEEDED:
+            state_ptr->success = true;
+            RCLCPP_INFO(logger, "Goal succeeded");
+            break;
+          case rclcpp_action::ResultCode::ABORTED:
+            state_ptr->success = false;
+            RCLCPP_ERROR(logger, "Goal was aborted");
+            break;
+          case rclcpp_action::ResultCode::CANCELED:
+            state_ptr->success = false;
+            RCLCPP_WARN(logger, "Goal was canceled");
+            break;
+          default:
+            state_ptr->success = false;
+            RCLCPP_ERROR(logger, "Unknown result code");
+            break;
+        }
+        
+        // Store result thread-safely
+        {
+          std::lock_guard<std::mutex> lock(state_ptr->result_mutex);
+          state_ptr->result = result.result;
+        }
+      };
+
+    options.feedback_callback = 
+      [logger](auto, const auto& feedback) {
+        RCLCPP_INFO(logger, "Feedback: %s", feedback->state.c_str());
+      };
+
+    auto goal_handle_future = move_action_client_->async_send_goal(goal, options);
+
+    if (async)
+    {
+      // Return immediately for async execution
+      return moveit::core::MoveItErrorCode::SUCCESS;
+    }
+    else
+    {
+      // Blocking execution - wait for result
+      if (goal_handle_future.wait_for(std::chrono::seconds(1)) != std::future_status::ready)
+      {
+        RCLCPP_ERROR(logger, "Failed to send goal");
+        return moveit::core::MoveItErrorCode::FAILURE;
+      }
+
+      auto goal_handle = goal_handle_future.get();
+      if (!goal_handle)
+      {
+        RCLCPP_ERROR(logger, "Goal was rejected");
+        return moveit::core::MoveItErrorCode::FAILURE;
+      }
+
+      // Wait for the result
+      auto result_future = move_action_client_->async_get_result(goal_handle);
+      if (rclcpp::spin_until_future_complete(node_, result_future) != 
+          rclcpp::FutureReturnCode::SUCCESS)
+      {
+        RCLCPP_ERROR(logger, "Failed to get result");
+        return moveit::core::MoveItErrorCode::FAILURE;
+      }
+
+      auto result = result_future.get();
+      return state_ptr->success ? moveit::core::MoveItErrorCode::SUCCESS : 
+                                  moveit::core::MoveItErrorCode::FAILURE;
+    }
 }
 
 moveit::core::MoveItErrorCode MoveGroupInterface::plan(Plan& plan)
@@ -1559,6 +1737,32 @@ moveit::core::MoveItErrorCode MoveGroupInterface::plan(Plan& plan)
   return impl_->plan(plan);
 }
 
+
+bool MoveGroupInterface::isAsyncExecutionActive() const
+{
+  return impl_->isAsyncExecutionActive();
+}
+
+bool MoveGroupInterface::isAsyncExecutionDone() const
+{
+  return impl_->isAsyncExecutionDone();
+}
+
+bool MoveGroupInterface::wasAsyncExecutionSuccessful() const
+{
+  return impl_->wasAsyncExecutionSuccessful();
+}
+
+moveit_msgs::action::MoveGroup::Result::SharedPtr 
+MoveGroupInterface::getAsyncExecutionResult() const
+{
+  return impl_->getAsyncExecutionResult();
+}
+
+void MoveGroupInterface::cancelAsyncExecution()
+{
+  impl_->cancelAsyncExecution();
+}
 // moveit_msgs::action::Pickup::Goal MoveGroupInterface::constructPickupGoal(const std::string& object,
 //                                                                        std::vector<moveit_msgs::msg::Grasp> grasps,
 //                                                                        bool plan_only = false) const

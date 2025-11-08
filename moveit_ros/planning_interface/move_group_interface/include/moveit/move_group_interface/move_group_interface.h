@@ -79,7 +79,24 @@ MOVEIT_CLASS_FORWARD(MoveGroupInterface);  // Defines MoveGroupInterfacePtr, Con
     This class includes many default settings to make things easy to use. */
 class MOVEIT_MOVE_GROUP_INTERFACE_EXPORT MoveGroupInterface
 {
+
 public:
+
+  /** \brief Check if an async action is currently active */
+  bool isAsyncExecutionActive() const;
+  
+  /** \brief Check if the last async action completed */
+  bool isAsyncExecutionDone() const;
+  
+  /** \brief Check if the last async action succeeded */
+  bool wasAsyncExecutionSuccessful() const;
+  
+  /** \brief Get the result of the last async action (thread-safe) */
+  moveit_msgs::action::MoveGroup::Result::SharedPtr getAsyncExecutionResult() const;
+  
+  /** \brief Cancel the current async action if active */
+  void cancelAsyncExecution();
+
   /** \brief Default ROS parameter name from where to read the robot's URDF. Set to 'robot_description' */
   static const std::string ROBOT_DESCRIPTION;
 
@@ -1014,6 +1031,17 @@ private:
   std::map<std::string, std::vector<double> > remembered_joint_values_;
   class MoveGroupInterfaceImpl;
   MoveGroupInterfaceImpl* impl_;
+  struct AsyncState {
+    std::atomic<bool> active{false};
+    std::atomic<bool> done{false};
+    std::atomic<bool> success{false};
+    std::mutex result_mutex;
+    moveit_msgs::action::MoveGroup::Result::SharedPtr result;
+    rclcpp_action::ClientGoalHandle<moveit_msgs::action::MoveGroup>::SharedPtr goal_handle;
+  };
+  
+  std::shared_ptr<AsyncState> async_state_;
+  std::mutex async_state_mutex_;
 };
 }  // namespace planning_interface
 }  // namespace moveit
